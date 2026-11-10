@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Fetch temporal-transfer freeze commit
+        run: git fetch origin tag temporal-transfer-proof-zero-freeze
       - name: Run zero-dependency tests
         run: python -W error -m unittest discover -s tests -v
       - name: Compile sources
