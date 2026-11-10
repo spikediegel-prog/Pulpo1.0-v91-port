@@ -33,15 +33,26 @@ Not portable upstream, omitted (see the test file's PORT NOTE):
   permit<->policy/issuer binding, so there is no stored binding to re-check),
 - the NULL-expiry test (upstream `issue_permit` has no `expires_at_ns`).
 
-Coordinator route NOT wired in this port (no `coordinator=` parameter in
-the executor or orchestrator), per the port instructions. Correction to
-those instructions: the custody stack DOES exist upstream —
-`pulpo/custody_domain.py` has `GovernedDomainAttemptCoordinator` with the
-same `authorize()` / `reserve()` / `.budget` API, and `pulpo/custody.py`
-has `CustodyViolation`. The "no custody stack upstream" premise was wrong;
-wiring the coordinator route is a small follow-on (the three
-coordinator-route tests were omitted for the same reason), not a missing
-dependency.
+Coordinator route wired as a follow-on (PR #2, branch
+`port/coordinator-wiring`, on top of merged PR #1): `DomainCommerceExecutor`
+takes `coordinator=` and routes purchase attempts through
+`GovernedDomainAttemptCoordinator` (locked-target resolution, canonical
+consume, audit-tip check, custody attempt) before the provider call; the
+orchestrator passes it through. The three coordinator-route tests are
+ported with it (happy path, unknown outcome carrying the custody attempt
+id, target/budget mismatch refusals); core suite 486 OK, skipped=1.
+Correction to the original port instructions: the custody stack DOES exist
+upstream — `pulpo/custody_domain.py` has
+`GovernedDomainAttemptCoordinator` with the same `authorize()` /
+`reserve()` / `.budget` API, and `pulpo/custody.py` has `CustodyViolation`.
+The "no custody stack upstream" premise was wrong.
+
+Still NOT there (honest limits of this follow-on): no reconciliation state
+machine — an attempt whose outcome is unknown stays recorded as
+`attempt_authorized`; the canonical `purchase_consequence_unknown` audit
+event is the reconciliation-required record. No evidence vocabulary —
+`pulpo/evidence_observation.py` and `pulpo/evidence_export.py` do not
+exist upstream.
 
 ## Slice 2 — clock TOCTOU fix in kernel state
 
