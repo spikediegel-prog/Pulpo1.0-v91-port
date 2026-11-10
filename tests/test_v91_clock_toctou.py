@@ -270,6 +270,59 @@ class ClockToctouTests(unittest.TestCase):
         self.assertEqual(state.audit[-1]["event"], "permit_rejected")
         self.assertEqual(state.audit[-1]["timestamp_ns"], 0)
 
+    def _backends(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "state.sqlite3"
+        sqlite_state = SQLiteKernelState(path)
+        self.addCleanup(sqlite_state.close)
+        return (("in-memory", InMemoryKernelState()), ("sqlite", sqlite_state))
+
+    def test_consume_with_untrusted_clock_sample_records_rejection(self):
+        # F6: a clock that raises (or returns an invalid sample) at the
+        # pre-lock sample used to propagate raw out of consume, unrecorded.
+        # The #325 guard fails closed with a permit_rejected record and
+        # leaves the permit unspent, exactly as Preview does.
+        def raising():
+            raise RuntimeError("clock broke")
+
+        for clock_name, clock in (
+            ("raising", raising),
+            ("zero", lambda: 0),
+            ("negative", lambda: -1),
+            ("non-int", lambda: "not-a-time"),
+            ("bool", lambda: True),
+        ):
+            for backend_name, state in self._backends():
+                with self.subTest(clock=clock_name, backend=backend_name):
+                    good = _kernel(state, clock=lambda: T0)
+                    decision = good.evaluate(_intent())
+                    self.assertEqual("allow", decision.outcome)
+                    failing = _kernel(state, clock=clock)
+                    self.assertFalse(failing.consume(decision.permit, _intent()))
+                    rejected = state.audit[-1]
+                    self.assertEqual(rejected["event"], "permit_rejected")
+                    self.assertEqual(rejected["payload"]["reason"], "permit_clock_invalid")
+                    self.assertEqual(rejected["timestamp_ns"], 0)
+                    # The permit was not burned: a good clock still consumes it.
+                    self.assertTrue(_kernel(state, clock=lambda: T0).consume(decision.permit, _intent()))
+
+    def test_issue_with_untrusted_clock_sample_raises_permit_clock_invalid(self):
+        # F6: _issue_permit used to pass the kernel's own sample unchecked,
+        # so a raising (or invalid) clock propagated raw out of evaluate.
+        # The #325 guard raises RuntimeError("permit_clock_invalid") and
+        # issues nothing.
+        def raising():
+            raise RuntimeError("clock broke")
+
+        for clock_name, clock in (("raising", raising), ("zero", lambda: 0)):
+            for backend_name, state in self._backends():
+                with self.subTest(clock=clock_name, backend=backend_name):
+                    kernel = _kernel(state, clock=clock)
+                    with self.assertRaisesRegex(RuntimeError, "permit_clock_invalid"):
+                        kernel.evaluate(_intent())
+                    self.assertEqual(state.audit, [])
+
 
 
 class NormalIssueConsumeTests(unittest.TestCase):
