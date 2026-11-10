@@ -721,6 +721,26 @@ class GovernanceKernel:
         digest = self.intent_hash(intent)
         return self._state.consume_permit(permit, digest, self._clock())
 
+    def revalidate_consumed_permit(self, permit: str, intent: Intent) -> str:
+        """Re-read permit/directive state for an already-spent permit.
+
+        Call immediately before execution, after `consume`, to close the window
+        in which a revocation can land between consumption and the
+        consequential call. Returns "valid" or a fail-closed reason; never
+        mutates state and never re-issues.
+
+        PORT NOTE (v9.1 slice 1, upstream f084863): upstream state records no
+        permit<->policy/issuer binding and no permit expiry, so this re-check
+        covers existence, intent binding, spent flag, and the directive
+        binding only. The Preview also re-checks policy/issuer/expiry.
+        """
+
+        digest = self.intent_hash(intent)
+        now_ns = self._trusted_now()
+        if now_ns is None:
+            return "permit_clock_invalid"
+        return self._state.revalidate_consumed_permit(permit, digest, now_ns)
+
     def verify_audit(self) -> bool:
         previous = "0" * 64
         for record in self.audit:
