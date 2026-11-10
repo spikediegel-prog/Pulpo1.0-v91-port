@@ -14,6 +14,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .custody import CustodyViolation
@@ -36,6 +37,22 @@ def _hash(value: Any) -> str:
 
 class CommerceViolation(ValueError):
     """A purchase object or state transition violated the commerce contract."""
+
+
+# One retry after a short backoff when a durable purchase-evidence record
+# fails to append (e.g. SQLite locked). The retry is safe because append is
+# atomic on both backends: a failed append lands nothing, so the retry
+# cannot duplicate a record.
+_EVIDENCE_RECORD_RETRY_DELAY_S = 0.05
+
+
+class PurchaseEvidenceError(Exception):
+    """A durable purchase-evidence record could not be written to the audit.
+
+    Raised by DomainCommerceExecutor._record_purchase_event after one retry,
+    so an unrecorded outcome is observable instead of silently lost (F1).
+    The event name that failed is carried on the exception.
+    """
 
 
 def _require_sha256(value: str, field: str) -> None:
@@ -745,14 +762,24 @@ class DomainCommerceExecutor:
         payload: dict[str, Any],
         now_ns: int,
     ) -> None:
-        # Best effort only: the spent permit, the attempted reservation, and
-        # the attempt set already block any retry, so a failed projection must
-        # never mask the outcome the caller has to reconcile. The failure mode
-        # is evidence-only, not a second execution right.
+        # F1: a failed record is never swallowed. The spent permit, the
+        # attempted reservation, and the attempt set already block any
+        # retry, but the audit record is the only durable evidence of the
+        # outcome; losing it silently would delete exactly what slice 1
+        # exists to preserve. Retry once after a short backoff; if it
+        # still fails, raise PurchaseEvidenceError so the caller learns the
+        # evidence is unrecorded. The failure mode is evidence-only, not
+        # a second execution right -- no new capability is granted here.
         try:
             kernel._state.append(event, payload, now_ns)  # noqa: SLF001 - existing canonical audit seam
+            return
         except Exception:
             pass
+        time.sleep(_EVIDENCE_RECORD_RETRY_DELAY_S)
+        try:
+            kernel._state.append(event, payload, now_ns)  # noqa: SLF001 - existing canonical audit seam
+        except Exception as exc:
+            raise PurchaseEvidenceError(event) from exc
 
     def _purchase_payload(
         self,
@@ -836,15 +863,20 @@ class DomainCommerceExecutor:
         # consequence exists.
         revalidation = kernel.revalidate_consumed_permit(permit, intent)
         if revalidation != "valid":
-            self._record_purchase_event(
-                kernel,
-                "purchase_revalidation_failed",
-                self._purchase_payload(
-                    kernel, order, intent, permit, reservation_id,
-                    reason=revalidation, custody_attempt=custody_attempt,
-                ),
-                now_ns,
-            )
+            try:
+                self._record_purchase_event(
+                    kernel,
+                    "purchase_revalidation_failed",
+                    self._purchase_payload(
+                        kernel, order, intent, permit, reservation_id,
+                        reason=revalidation, custody_attempt=custody_attempt,
+                    ),
+                    now_ns,
+                )
+            except PurchaseEvidenceError as evidence_exc:
+                # The refusal reason stays the primary error; the lost
+                # record is chained so the evidence gap is visible.
+                raise CommerceViolation(revalidation) from evidence_exc
             raise CommerceViolation(revalidation)
 
         try:
@@ -853,17 +885,24 @@ class DomainCommerceExecutor:
             # The provider call may already have changed reality. Record the
             # unknown outcome as durable canonical evidence, then re-raise the
             # original failure unchanged: no silent success, no blind retry.
-            self._record_purchase_event(
-                kernel,
-                "purchase_consequence_unknown",
-                self._purchase_payload(
-                    kernel, order, intent, permit, reservation_id,
-                    reason="external_consequence_not_yet_verified",
-                    custody_attempt=custody_attempt,
-                    error=type(exc).__name__,
-                ),
-                now_ns,
-            )
+            # If the record itself cannot be written, the caller learns that
+            # too: a CommerceViolation chained from the provider error, so
+            # the outcome stays unknown and the missing evidence stays
+            # visible. The provider error is preserved as the cause.
+            try:
+                self._record_purchase_event(
+                    kernel,
+                    "purchase_consequence_unknown",
+                    self._purchase_payload(
+                        kernel, order, intent, permit, reservation_id,
+                        reason="external_consequence_not_yet_verified",
+                        custody_attempt=custody_attempt,
+                        error=type(exc).__name__,
+                    ),
+                    now_ns,
+                )
+            except PurchaseEvidenceError:
+                raise CommerceViolation("purchase_evidence_unrecorded") from exc
             raise
 
         if result.payment_id is not None or result.charged_cents is not None or result.receipt_hash is not None:

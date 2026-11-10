@@ -851,9 +851,13 @@ class GovernanceKernel:
         # Only the kernel's own sample is re-sampled inside the state
         # transaction. An explicitly supplied timestamp (the approval path's
         # post-verification time) is a deliberate binding, not a race, and is
-        # passed through without a clock.
+        # passed through without a clock -- but it is still validated for
+        # shape, exactly as a kernel sample is: a non-int or non-positive
+        # timestamp never reaches the state (Preview #325 guard).
         sampled_here = timestamp_ns is None
-        issued_at_ns = self._clock() if sampled_here else timestamp_ns
+        issued_at_ns = self._trusted_now() if sampled_here else timestamp_ns
+        if type(issued_at_ns) is not int or issued_at_ns <= 0:
+            raise RuntimeError("permit_clock_invalid")
         try:
             replay = self._state.issue_permit(permit, digest, reason, issued_at_ns, approval,
                 clock=self._clock if sampled_here else None)
@@ -906,7 +910,15 @@ class GovernanceKernel:
 
     def consume(self, permit: str, intent: Intent) -> bool:
         digest = self.intent_hash(intent)
-        now_ns = self._clock()
+        # Ported from upstream #325: refuse consumption on an invalid clock
+        # instead of stamping the permit with an untrusted timestamp. A
+        # clock that raises (or returns a non-int / non-positive sample)
+        # used to propagate raw out of consume, unrecorded; now it fails
+        # closed with a permit_rejected record, exactly as Preview does.
+        now_ns = self._trusted_now()
+        if now_ns is None:
+            self._state.append("permit_rejected", {"intent_hash": digest, "reason": "permit_clock_invalid"}, 0)
+            return False
         try:
             # The pre-lock sample is the fallback; the state re-samples the
             # clock after acquiring the lock, so the validity checks inside
