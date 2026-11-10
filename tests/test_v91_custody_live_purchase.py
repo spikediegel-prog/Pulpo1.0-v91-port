@@ -375,4 +375,3 @@ class LivePurchaseCustodyTests(unittest.TestCase):
                 )
             self.assertEqual(0, should_not_run.calls)
             self.assertEqual(1, len(audit_events(kernel, "purchase_consequence_unknown")))
-
