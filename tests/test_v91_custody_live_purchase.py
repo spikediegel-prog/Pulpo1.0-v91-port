@@ -15,17 +15,21 @@ These tests prove the slice-1 fix in `DomainCommerceExecutor.execute`:
 (b) the pre-purchase revalidation refuses when permit/directive
     state changed between consume and purchase;
 (c) the happy path still succeeds exactly as before;
-(d) a retry after an uncertain outcome is blocked, not silently retried.
+(d) a retry after an uncertain outcome is blocked, not silently retried;
+(e) the coordinator route: consumption runs through
+    `GovernedDomainAttemptCoordinator` (locked-target resolution, canonical
+    consume, custody attempt) and the unknown outcome carries the custody
+    attempt id.
 
-PORT NOTE (upstream f084863): the custody-coordinator route is NOT ported
-here (no `coordinator=` wiring in `DomainCommerceExecutor`); the coordinator
-itself exists upstream (pulpo/custody_domain.py), so those three tests are a
-small follow-on. Also not portable upstream: the expired-permit test (no
-permit TTL upstream), the policy-hash test (no permit<->policy binding
-stored upstream), and the NULL-expiry test (no `expires_at_ns` on upstream
-`issue_permit`). Upstream permits never expire and carry no policy/issuer
-binding, so the revalidation covers existence, intent binding, spent flag,
-and the directive binding only.
+PORT NOTE (upstream f084863): the custody-coordinator route IS wired here
+(`coordinator=` in `DomainCommerceExecutor`, passed through by the
+orchestrator), ported from Preview slice 1 as a follow-on; the three
+coordinator-route tests below cover it. Not portable upstream: the
+expired-permit test (no permit TTL upstream), the policy-hash test (no
+permit<->policy binding stored upstream), and the NULL-expiry test (no
+`expires_at_ns` on upstream `issue_permit`). Upstream permits never expire
+and carry no policy/issuer binding, so the revalidation covers existence,
+intent binding, spent flag, and the directive binding only.
 """
 
 import sqlite3
@@ -44,6 +48,8 @@ from pulpo.commerce import (
     assess_quote,
     purchase_intent,
 )
+from pulpo.custody import SQLiteGovernanceCustody
+from pulpo.custody_domain import GovernedDomainAttemptCoordinator
 from pulpo.directives import (
     Directive,
     DirectiveAuthorityController,
@@ -375,3 +381,103 @@ class LivePurchaseCustodyTests(unittest.TestCase):
                 )
             self.assertEqual(0, should_not_run.calls)
             self.assertEqual(1, len(audit_events(kernel, "purchase_consequence_unknown")))
+
+    # Coordinator route.
+    def custody_stack(self, path):
+        custody = SQLiteGovernanceCustody(
+            path,
+            signing_secret=b"v91-custody-test-secret",
+            clock=lambda: NOW,
+        )
+        budget = SQLiteBudgetAccount(path)
+        state = SQLiteKernelState(path)
+        kernel = GovernanceKernel(
+            Policy(frozenset({"purchase_domain"}), 3_000),
+            secret=b"v91-test-secret",
+            clock=lambda: NOW,
+            state=state,
+        )
+        coordinator = GovernedDomainAttemptCoordinator(kernel, custody, budget)
+        self.addCleanup(state.close)
+        return kernel, custody, budget, coordinator
+
+    def test_coordinator_route_happy_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custody.sqlite3"
+            kernel, custody, budget, coordinator = self.custody_stack(path)
+            order = self.order()
+            intent = purchase_intent(order)
+            target = kernel.lock_target("domain-v91", intent)
+            decision = kernel.evaluate(intent)
+            self.assertEqual("allow", decision.outcome)
+            reservation = coordinator.reserve(order)
+            registrar = FakeRegistrar(
+                RegistrarResult("payment-1", 2_000, "a" * 64, "registration-1", order.domain, order.registrar)
+            )
+            outcome = DomainCommerceExecutor(coordinator=coordinator).execute(
+                kernel, order, decision.permit, registrar, budget,
+                reservation.reservation_id, now_ns=NOW,
+                target_id=target.target_id, expected_target_hash=target.target_hash,
+            )
+            self.assertTrue(outcome.authorized)
+            self.assertEqual(1, registrar.calls)
+            self.assertEqual([], audit_events(kernel, "purchase_consequence_unknown"))
+            self.assertEqual([], audit_events(kernel, "purchase_revalidation_failed"))
+            self.assertEqual("permit_consumed", kernel.audit[-1]["event"])
+            self.assertTrue(kernel.verify_audit())
+
+    def test_coordinator_route_records_unknown_outcome_with_attempt_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custody.sqlite3"
+            kernel, custody, budget, coordinator = self.custody_stack(path)
+            order = self.order()
+            intent = purchase_intent(order)
+            target = kernel.lock_target("domain-v91", intent)
+            decision = kernel.evaluate(intent)
+            reservation = coordinator.reserve(order)
+            uncertain = UncertainRegistrar()
+
+            with self.assertRaisesRegex(ConnectionError, "unknown"):
+                DomainCommerceExecutor(coordinator=coordinator).execute(
+                    kernel, order, decision.permit, uncertain, budget,
+                    reservation.reservation_id, now_ns=NOW,
+                    target_id=target.target_id, expected_target_hash=target.target_hash,
+                )
+            self.assertEqual(1, uncertain.calls)
+            unknown = audit_events(kernel, "purchase_consequence_unknown")
+            self.assertEqual(1, len(unknown))
+            attempt_id = unknown[0]["payload"]["custody_attempt_id"]
+            self.assertIsNotNone(attempt_id)
+            # No attempt_authorized -> reconciliation_required edge exists in
+            # the custody state machine, so the custody attempt stays
+            # authorized and the canonical audit event is the
+            # reconciliation-required record for the live path.
+            self.assertEqual("attempt_authorized", custody.attempt(attempt_id).state)
+            self.assertTrue(kernel.verify_audit())
+
+    def test_coordinator_route_requires_target_and_matching_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custody.sqlite3"
+            kernel, _, budget, coordinator = self.custody_stack(path)
+            order = self.order()
+            decision = kernel.evaluate(purchase_intent(order))
+            reservation = coordinator.reserve(order)
+            registrar = FakeRegistrar(
+                RegistrarResult("payment-1", 2_000, "a" * 64, "registration-1", order.domain, order.registrar)
+            )
+            with self.assertRaisesRegex(CommerceViolation, "custody_target_required"):
+                DomainCommerceExecutor(coordinator=coordinator).execute(
+                    kernel, order, decision.permit, registrar, budget,
+                    reservation.reservation_id, now_ns=NOW,
+                )
+            self.assertEqual(0, registrar.calls)
+
+            other_budget = SQLiteBudgetAccount(path)
+            target = kernel.lock_target("domain-v91", purchase_intent(order))
+            with self.assertRaisesRegex(CommerceViolation, "custody_budget_mismatch"):
+                DomainCommerceExecutor(coordinator=coordinator).execute(
+                    kernel, order, decision.permit, registrar, other_budget,
+                    reservation.reservation_id, now_ns=NOW,
+                    target_id=target.target_id, expected_target_hash=target.target_hash,
+                )
+            self.assertEqual(0, registrar.calls)

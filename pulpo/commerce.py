@@ -14,9 +14,13 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+from .custody import CustodyViolation
 from .kernel import GovernanceKernel, Intent
+
+if TYPE_CHECKING:
+    from .custody_domain import GovernedDomainAttempt, GovernedDomainAttemptCoordinator
 
 
 PILOT_PURCHASE_CEILING_CENTS = 3_000
@@ -713,21 +717,26 @@ class CommerceOutcome:
 class DomainCommerceExecutor:
     """Consume a Pulpo permit before invoking a registrar adapter exactly once.
 
-    The live purchase path. The executor re-reads permit/directive state
-    immediately before the provider call and records an unknown provider
-    outcome as durable canonical evidence. No new executor, no second ledger:
-    unknown outcomes are events in the existing canonical audit.
+    The live purchase path. When a `GovernedDomainAttemptCoordinator` is
+    supplied, consumption runs through it: exact locked-target resolution,
+    canonical consume, audit-tip verification, and one custody attempt, before
+    any transmission right is released. Without one, the same direct consume
+    runs, and both paths share the pre-purchase revalidation and the durable
+    unknown-outcome record below. No new executor, no second ledger: unknown
+    outcomes are events in the existing canonical audit.
 
-    PORT NOTE (v9.1 slice 1, upstream f084863): the custody-coordinator route
-    is NOT wired here (no `coordinator=` parameter, no locked-target
-    resolution through the coordinator). The coordinator itself exists
-    upstream (pulpo/custody_domain.py), so wiring it is a small follow-on;
-    this port carries the direct path only: same pre-purchase revalidation
-    and the same durable unknown-outcome record.
+    PORT NOTE (upstream f084863): upstream permits carry no policy/issuer
+    binding or expiry, so the pre-purchase revalidation covers existence,
+    intent binding, spent flag, and directive binding only.
     """
 
-    def __init__(self, attempted_order_hashes: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        attempted_order_hashes: set[str] | None = None,
+        coordinator: GovernedDomainAttemptCoordinator | None = None,
+    ) -> None:
         self.attempted_order_hashes = attempted_order_hashes if attempted_order_hashes is not None else set()
+        self.coordinator = coordinator
 
     def _record_purchase_event(
         self,
@@ -754,6 +763,7 @@ class DomainCommerceExecutor:
         reservation_id: str,
         *,
         reason: str,
+        custody_attempt: GovernedDomainAttempt | None,
         error: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -766,6 +776,8 @@ class DomainCommerceExecutor:
         }
         if error is not None:
             payload["error"] = error
+        if custody_attempt is not None:
+            payload["custody_attempt_id"] = custody_attempt.attempt_id
         return payload
 
     def execute(
@@ -778,21 +790,43 @@ class DomainCommerceExecutor:
         reservation_id: str,
         *,
         now_ns: int,
+        target_id: str | None = None,
+        expected_target_hash: str | None = None,
+        target_version: int = 1,
     ) -> CommerceOutcome:
         if now_ns >= order.expires_at_ns:
             raise CommerceViolation("order_expired")
         if order.order_hash in self.attempted_order_hashes:
             raise CommerceViolation("duplicate_purchase_attempt")
 
-        budget.require_active(reservation_id, order, now_ns=now_ns)
-
         intent = purchase_intent(order)
-        if not kernel.consume(permit, intent):
-            raise CommerceViolation("permit_rejected")
+        custody_attempt: GovernedDomainAttempt | None = None
+        if self.coordinator is not None:
+            # The coordinator owns its budget account; a different account
+            # would mark the attempt on one store and reconcile on another.
+            if budget is not self.coordinator.budget:
+                raise CommerceViolation("custody_budget_mismatch")
+            if not target_id or not expected_target_hash:
+                raise CommerceViolation("custody_target_required")
+            try:
+                custody_attempt = self.coordinator.authorize(
+                    target_id=target_id,
+                    expected_target_hash=expected_target_hash,
+                    order=order,
+                    permit=permit,
+                    reservation_id=reservation_id,
+                    version=target_version,
+                )
+            except CustodyViolation as exc:
+                raise CommerceViolation(str(exc)) from exc
+        else:
+            budget.require_active(reservation_id, order, now_ns=now_ns)
+            if not kernel.consume(permit, intent):
+                raise CommerceViolation("permit_rejected")
 
-        # Mark before the external call.  An uncertain network outcome must be
-        # reconciled, not blindly retried with a new capability.
-        budget.mark_attempted(reservation_id)
+            # Mark before the external call.  An uncertain network outcome must be
+            # reconciled, not blindly retried with a new capability.
+            budget.mark_attempted(reservation_id)
         self.attempted_order_hashes.add(order.order_hash)
         outcome = CommerceOutcome(order_hash=order.order_hash, authorized=True, capability_revoked=True)
 
@@ -807,7 +841,7 @@ class DomainCommerceExecutor:
                 "purchase_revalidation_failed",
                 self._purchase_payload(
                     kernel, order, intent, permit, reservation_id,
-                    reason=revalidation,
+                    reason=revalidation, custody_attempt=custody_attempt,
                 ),
                 now_ns,
             )
@@ -825,6 +859,7 @@ class DomainCommerceExecutor:
                 self._purchase_payload(
                     kernel, order, intent, permit, reservation_id,
                     reason="external_consequence_not_yet_verified",
+                    custody_attempt=custody_attempt,
                     error=type(exc).__name__,
                 ),
                 now_ns,
