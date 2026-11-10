@@ -6,6 +6,7 @@ from .authority import (
     AuthorityTrust,
     Ed25519ApprovalVerifier,
     P256ApprovalVerifier,
+    PolicyEnvelope,
 )
 from .authority_client import AuthorityApprovalRequest, AuthorityClient, AuthorityPoll
 from .ceremony import (
@@ -24,8 +25,10 @@ from .kernel import (
     Intent,
     LockedTarget,
     Policy,
+    PolicyEnvelopeError,
     StateIntegrityError,
     TargetResolution,
+    policy_hash_for,
 )
 from .namecom import NameComCoreAdapter
 from .orchestrator import (
@@ -35,7 +38,7 @@ from .orchestrator import (
     OrchestrationError,
     PulpoOrchestrator,
 )
-from .state import InMemoryKernelState, KernelState, SQLiteKernelState
+from .state import InMemoryKernelState, KernelState, SQLiteKernelState, StateClockError
 from .target_reconcile import (
     ArtifactCompletionEvidence,
     GovernedTargetReconciliation,
@@ -73,9 +76,13 @@ __all__ = [
     "P256ApprovalVerifier",
     "P256CeremonyVerifier",
     "Policy",
+    "PolicyEnvelope",
+    "PolicyEnvelopeError",
     "PulpoOrchestrator",
+    "policy_hash_for",
     "SQLiteBudgetAccount",
     "SQLiteKernelState",
+    "StateClockError",
     "StateIntegrityError",
     "TargetObligationStatus",
     "TargetResolution",

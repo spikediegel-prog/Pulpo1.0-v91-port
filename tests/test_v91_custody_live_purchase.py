@@ -1,0 +1,377 @@
+"""v9.1 slice 1 (ported to upstream f084863): pre-purchase revalidation
+and the durable unknown-outcome record on the live purchase path.
+
+Verification report (2026-11-09) section 6a/6b(c)(d): on the live orchestrator
+path, `adapter.purchase` raising left no unknown outcome anywhere in the
+canonical audit chain -- the permit was already spent and the uncertainty
+existed only as a raised exception -- and nothing re-read permit/directive/
+policy/expiry state between consumption and the provider call.
+
+These tests prove the slice-1 fix in `DomainCommerceExecutor.execute`:
+
+(a) a live-path purchase attempt that raises after consume records a
+    `purchase_consequence_unknown` event in the canonical audit (durable
+    evidence, not just a raised exception);
+(b) the pre-purchase revalidation refuses when permit/directive
+    state changed between consume and purchase;
+(c) the happy path still succeeds exactly as before;
+(d) a retry after an uncertain outcome is blocked, not silently retried.
+
+PORT NOTE (upstream f084863): the custody-coordinator route is NOT ported
+here (no `coordinator=` wiring in `DomainCommerceExecutor`); the coordinator
+itself exists upstream (pulpo/custody_domain.py), so those three tests are a
+small follow-on. Also not portable upstream: the expired-permit test (no
+permit TTL upstream), the policy-hash test (no permit<->policy binding
+stored upstream), and the NULL-expiry test (no `expires_at_ns` on upstream
+`issue_permit`). Upstream permits never expire and carry no policy/issuer
+binding, so the revalidation covers existence, intent binding, spent flag,
+and the directive binding only.
+"""
+
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from pulpo.commerce import (
+    BudgetAccount,
+    CommerceViolation,
+    DomainCommerceExecutor,
+    DomainPurchaseRequest,
+    DomainQuote,
+    RegistrarResult,
+    SQLiteBudgetAccount,
+    assess_quote,
+    purchase_intent,
+)
+from pulpo.directives import (
+    Directive,
+    DirectiveAuthorityController,
+    GovernedDirectiveProjection,
+)
+from pulpo.kernel import GovernanceKernel, Policy
+from pulpo.orchestrator import PulpoOrchestrator
+from pulpo.state import InMemoryKernelState, SQLiteKernelState
+from tests.authority_support import HmacTestVerifier, signed_envelope, signed_policy_envelope, trust_for
+
+NOW = 8_000_000
+OPERATOR = "operator:owner"
+
+
+class FakeRegistrar:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def purchase(self, order, *, max_charge_cents):
+        self.calls += 1
+        return self.result
+
+
+class UncertainRegistrar:
+    def __init__(self):
+        self.calls = 0
+
+    def purchase(self, order, *, max_charge_cents):
+        del order, max_charge_cents
+        self.calls += 1
+        raise ConnectionError("provider result is unknown")
+
+
+class HookedBudget:
+    """BudgetState delegate that runs a hook inside mark_attempted.
+
+    The hook simulates state changing between permit consumption and the
+    provider call: exactly the window the pre-purchase revalidation closes.
+    """
+
+    def __init__(self, wrapped, hook):
+        self._wrapped = wrapped
+        self._hook = hook
+
+    def require_active(self, reservation_id, order, *, now_ns):
+        return self._wrapped.require_active(reservation_id, order, now_ns=now_ns)
+
+    def mark_attempted(self, reservation_id):
+        self._hook()
+        return self._wrapped.mark_attempted(reservation_id)
+
+    def reconcile(self, reservation_id, payment):
+        return self._wrapped.reconcile(reservation_id, payment)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+def audit_events(kernel, event):
+    return [record for record in kernel.audit if record.get("event") == event]
+
+
+class LivePurchaseCustodyTests(unittest.TestCase):
+    def order(self, domain="pulpo-live-purchase.example", *, price=2_000):
+        request = DomainPurchaseRequest(
+            request_id=f"request-v91:{domain}",
+            principal="agent:commerce",
+            acceptable_domains=(domain,),
+            max_purchase_cents=3_000,
+            max_renewal_cents=2_500,
+            approved_registrar="name.com",
+            owner_ref="owner://iron-ember",
+            privacy_required=True,
+            prohibited_upsells=("hosting",),
+            expires_at_ns=NOW + 100_000,
+        )
+        quote = DomainQuote(
+            quote_id=f"quote:{domain}",
+            domain=domain,
+            registrar="name.com",
+            purchase_price_cents=price,
+            renewal_price_cents=2_400,
+            owner_ref="owner://iron-ember",
+            privacy_enabled=True,
+            upsells=(),
+            expires_at_ns=NOW + 50_000,
+        )
+        assessment = assess_quote(
+            request,
+            quote,
+            credential_ref="credential://name-com/v91-live-purchase",
+            now_ns=NOW,
+        )
+        self.assertIsNotNone(assessment.order)
+        return assessment.order
+
+    def kernel_with(self, order, *, state=None, clock=None):
+        kernel = GovernanceKernel(
+            Policy(frozenset({"purchase_domain"}), 3_000),
+            secret=b"test-secret",
+            clock=clock or (lambda: NOW),
+            state=state,
+        )
+        permit = kernel.evaluate(purchase_intent(order)).permit
+        self.assertIsNotNone(permit)
+        return kernel, permit
+
+    # (a) Unknown outcome becomes durable canonical evidence.
+    def test_uncertain_live_purchase_records_unknown_outcome_in_canonical_audit(self):
+        order = self.order()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kernel.sqlite3"
+            state = SQLiteKernelState(path)
+            self.addCleanup(state.close)
+            kernel, permit = self.kernel_with(order, state=state)
+            budget = SQLiteBudgetAccount(path)
+            reservation = budget.reserve(order, now_ns=NOW)
+            uncertain = UncertainRegistrar()
+
+            with self.assertRaisesRegex(ConnectionError, "unknown"):
+                DomainCommerceExecutor().execute(
+                    kernel, order, permit, uncertain, budget,
+                    reservation.reservation_id, now_ns=NOW,
+                )
+            self.assertEqual(1, uncertain.calls)
+
+            unknown = audit_events(kernel, "purchase_consequence_unknown")
+            self.assertEqual(1, len(unknown))
+            payload = unknown[0]["payload"]
+            self.assertEqual(order.order_hash, payload["order_hash"])
+            self.assertEqual(kernel.intent_hash(purchase_intent(order)), payload["intent_hash"])
+            self.assertEqual(reservation.reservation_id, payload["reservation_id"])
+            self.assertEqual("external_consequence_not_yet_verified", payload["reason"])
+            self.assertEqual("ConnectionError", payload["error"])
+            consumed = audit_events(kernel, "permit_consumed")
+            self.assertEqual(1, len(consumed))
+            self.assertLess(
+                kernel.audit.index(consumed[0]),
+                kernel.audit.index(unknown[0]),
+            )
+            self.assertTrue(kernel.verify_audit())
+
+            # The record survives a restart of the canonical state.
+            reopened = SQLiteKernelState(path)
+            self.addCleanup(reopened.close)
+            reopened_kernel = GovernanceKernel(
+                Policy(frozenset({"purchase_domain"}), 3_000),
+                secret=b"test-secret",
+                clock=lambda: NOW,
+                state=reopened,
+            )
+            self.assertEqual(1, len(audit_events(reopened_kernel, "purchase_consequence_unknown")))
+            self.assertTrue(reopened_kernel.verify_audit())
+
+    def test_uncertain_live_purchase_records_unknown_outcome_in_memory_state(self):
+        order = self.order()
+        kernel, permit = self.kernel_with(order)
+        budget = BudgetAccount()
+        reservation = budget.reserve(order, now_ns=NOW)
+        uncertain = UncertainRegistrar()
+
+        with self.assertRaisesRegex(ConnectionError, "unknown"):
+            DomainCommerceExecutor().execute(
+                kernel, order, permit, uncertain, budget,
+                reservation.reservation_id, now_ns=NOW,
+            )
+        unknown = audit_events(kernel, "purchase_consequence_unknown")
+        self.assertEqual(1, len(unknown))
+        self.assertEqual(order.order_hash, unknown[0]["payload"]["order_hash"])
+        self.assertTrue(kernel.verify_audit())
+
+    def test_uncertain_live_purchase_records_unknown_outcome_via_orchestrator(self):
+        order = self.order()
+        kernel, permit = self.kernel_with(order)
+        orchestrator = PulpoOrchestrator(kernel)
+        budget = BudgetAccount()
+        reservation = budget.reserve(order, now_ns=NOW)
+        uncertain = UncertainRegistrar()
+
+        with self.assertRaisesRegex(ConnectionError, "unknown"):
+            orchestrator.execute_domain_purchase(
+                order, permit, uncertain, budget,
+                reservation.reservation_id, now_ns=NOW,
+            )
+        unknown = audit_events(kernel, "purchase_consequence_unknown")
+        self.assertEqual(1, len(unknown))
+        self.assertEqual("external_consequence_not_yet_verified", unknown[0]["payload"]["reason"])
+
+    # (b) Pre-purchase revalidation refuses state that changed after consume.
+    def test_pre_purchase_revalidation_refuses_revoked_directive(self):
+        verifier = HmacTestVerifier()
+        policy = Policy(
+            frozenset({"purchase_domain", "activate_directive", "revoke_directive"}),
+            3_000,
+            frozenset({"activate_directive", "revoke_directive"}),
+            authority_trust=trust_for(verifier),
+        )
+        kernel = GovernanceKernel(
+            policy,
+            secret=b"test-secret",
+            approval_verifier=verifier,
+            policy_envelope=signed_policy_envelope(policy, verifier),
+            clock=lambda: NOW,
+        )
+        order = self.order()
+        intent = purchase_intent(order)
+        directive = Directive(
+            directive_id="directive-v91-live",
+            version=1,
+            issuer_authority_id=verifier.authority_id,
+            principal=intent.principal,
+            allowed_actions=frozenset({"purchase_domain"}),
+            resource_prefixes=("commerce:domain:",),
+            max_cost=3_000,
+            issued_at_ns=NOW - 1_000,
+            expires_at_ns=NOW + 100_000,
+        )
+        controller = DirectiveAuthorityController(kernel)
+        activation = signed_envelope(
+            kernel,
+            controller.authority_intent(controller.ACTIVATE, directive, operator_principal=OPERATOR),
+            verifier,
+            now_ns=NOW - 10,
+            approval_id="approval-v91-activate",
+            nonce="nonce-v91-activate",
+        )
+        self.assertEqual(
+            "allow",
+            controller.activate(directive, activation, operator_principal=OPERATOR).outcome,
+        )
+        decision = GovernedDirectiveProjection(kernel).evaluate(intent, directive)
+        self.assertEqual("allow", decision.outcome)
+        self.assertIsNotNone(decision.permit)
+
+        def revoke_between_consume_and_purchase():
+            revocation = signed_envelope(
+                kernel,
+                controller.authority_intent(controller.REVOKE, directive, operator_principal=OPERATOR),
+                verifier,
+                now_ns=NOW - 10,
+                approval_id="approval-v91-revoke",
+                nonce="nonce-v91-revoke",
+            )
+            self.assertEqual(
+                "allow",
+                controller.revoke(directive, revocation, operator_principal=OPERATOR).outcome,
+            )
+
+        budget = HookedBudget(BudgetAccount(), revoke_between_consume_and_purchase)
+        reservation = budget.reserve(order, now_ns=NOW)
+        registrar = FakeRegistrar(
+            RegistrarResult("payment-1", 2_000, "a" * 64, "registration-1", order.domain, order.registrar)
+        )
+        with self.assertRaisesRegex(CommerceViolation, "directive_revoked"):
+            DomainCommerceExecutor().execute(
+                kernel, order, decision.permit, registrar, budget,
+                reservation.reservation_id, now_ns=NOW,
+            )
+        # Refused before any transmission: the provider was never called.
+        self.assertEqual(0, registrar.calls)
+        refusals = audit_events(kernel, "purchase_revalidation_failed")
+        self.assertEqual(1, len(refusals))
+        self.assertEqual("directive_revoked", refusals[0]["payload"]["reason"])
+        self.assertEqual(order.order_hash, refusals[0]["payload"]["order_hash"])
+        self.assertTrue(kernel.verify_audit())
+
+
+
+
+    # (c) Happy path unchanged.
+    def test_happy_path_unchanged(self):
+        order = self.order()
+        kernel, permit = self.kernel_with(order)
+        budget = BudgetAccount()
+        reservation = budget.reserve(order, now_ns=NOW)
+        registrar = FakeRegistrar(
+            RegistrarResult("payment-1", 2_000, "a" * 64, "registration-1", order.domain, order.registrar)
+        )
+        outcome = DomainCommerceExecutor().execute(
+            kernel, order, permit, registrar, budget,
+            reservation.reservation_id, now_ns=NOW,
+        )
+        self.assertTrue(outcome.authorized)
+        self.assertTrue(outcome.capability_revoked)
+        self.assertEqual("payment-1", outcome.payment.payment_id)
+        self.assertEqual(2_000, outcome.payment.charged_cents)
+        self.assertEqual("registration-1", outcome.delivery.registration_id)
+        self.assertEqual(1, registrar.calls)
+        self.assertEqual([], audit_events(kernel, "purchase_consequence_unknown"))
+        self.assertEqual([], audit_events(kernel, "purchase_revalidation_failed"))
+        self.assertTrue(kernel.verify_audit())
+
+    # (d) Retry after an uncertain outcome is blocked, not silently retried.
+    def test_retry_after_uncertain_outcome_is_blocked(self):
+        order = self.order()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "commerce.sqlite3"
+            kernel, permit = self.kernel_with(order)
+            budget = SQLiteBudgetAccount(path)
+            reservation = budget.reserve(order, now_ns=NOW)
+            uncertain = UncertainRegistrar()
+            executor = DomainCommerceExecutor()
+
+            with self.assertRaisesRegex(ConnectionError, "unknown"):
+                executor.execute(
+                    kernel, order, permit, uncertain, budget,
+                    reservation.reservation_id, now_ns=NOW,
+                )
+
+            # Same executor: the in-memory attempt set blocks the retry.
+            should_not_run = FakeRegistrar(
+                RegistrarResult("payment-1", 2_000, "a" * 64, "registration-1", order.domain, order.registrar)
+            )
+            with self.assertRaisesRegex(CommerceViolation, "duplicate_purchase_attempt"):
+                executor.execute(
+                    kernel, order, permit, should_not_run, budget,
+                    reservation.reservation_id, now_ns=NOW,
+                )
+            self.assertEqual(0, should_not_run.calls)
+
+            # Fresh executor after restart: the durable budget blocks it.
+            restarted = SQLiteBudgetAccount(path)
+            retry_kernel, retry_permit = self.kernel_with(order)
+            with self.assertRaisesRegex(CommerceViolation, "already_attempted"):
+                DomainCommerceExecutor().execute(
+                    retry_kernel, order, retry_permit, should_not_run, restarted,
+                    reservation.reservation_id, now_ns=NOW,
+                )
+            self.assertEqual(0, should_not_run.calls)
+            self.assertEqual(1, len(audit_events(kernel, "purchase_consequence_unknown")))

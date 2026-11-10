@@ -34,7 +34,7 @@ if CRYPTOGRAPHY_AVAILABLE:
         P256CeremonyVerifier,
         Policy,
     )
-    from tests.authority_support import signed_envelope, trust_for
+    from tests.authority_support import signed_envelope, signed_policy_envelope, trust_for
     from tests.test_ceremony_evidence import (
         NOW,
         SESSION,
@@ -106,8 +106,12 @@ class CeremonyKeyDerivationTests(unittest.TestCase):
         )
 
     def kernel_for(self, ceremony_verifier):
+        policy = self.policy_for(ceremony_verifier)
         return GovernanceKernel(
-            self.policy_for(ceremony_verifier),
+            policy,
+            policy_envelope=signed_policy_envelope(
+                policy, self.approval_verifier, sign=self.approval_signer.sign
+            ),
             secret=b"key-derivation-test-secret",
             approval_verifier=self.approval_verifier,
             clock=lambda: NOW,
@@ -181,6 +185,9 @@ class CeremonyKeyDerivationTests(unittest.TestCase):
         with self.assertRaises(AuthorityTrustError):
             GovernanceKernel(
                 policy,
+                policy_envelope=signed_policy_envelope(
+                    policy, self.approval_verifier, sign=self.approval_signer.sign
+                ),
                 secret=b"key-derivation-test-secret",
                 approval_verifier=self.approval_verifier,
                 clock=lambda: NOW,

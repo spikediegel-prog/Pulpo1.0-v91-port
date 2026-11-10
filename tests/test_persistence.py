@@ -15,7 +15,7 @@ from pulpo import (
     SQLiteKernelState,
     StateIntegrityError,
 )
-from tests.authority_support import HmacTestVerifier, signed_envelope, trust_for
+from tests.authority_support import HmacTestVerifier, signed_envelope, signed_policy_envelope, trust_for
 
 
 NOW = 1_000_000
@@ -38,6 +38,7 @@ class RestartSafeStateTests(unittest.TestCase):
     def kernel(self, state):
         return GovernanceKernel(
             self.policy,
+            policy_envelope=signed_policy_envelope(self.policy, self.verifier),
             secret=b"permit-secret",
             approval_verifier=self.verifier,
             clock=lambda: NOW,
@@ -174,7 +175,7 @@ class RestartSafeStateTests(unittest.TestCase):
         self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM approvals").fetchone()[0])
         self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM permits").fetchone()[0])
         self.assertEqual(
-            ["approval_verified", "decision"],
+            ["policy_head_accepted", "approval_verified", "decision"],
             [row[0] for row in connection.execute("SELECT event FROM audit ORDER BY sequence")],
         )
         self.assertTrue(kernel.consume(decision.permit, self.intent))
@@ -202,7 +203,11 @@ class RestartSafeStateTests(unittest.TestCase):
         with sqlite3.connect(self.path) as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM approvals").fetchone()[0])
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM permits").fetchone()[0])
-            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM audit").fetchone()[0])
+            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM audit").fetchone()[0])
+            self.assertEqual(
+                ["policy_head_accepted"],
+                [row[0] for row in connection.execute("SELECT event FROM audit ORDER BY sequence")],
+            )
 
     def test_failed_consumption_audit_rolls_back_spent_permit(self):
         state = SQLiteKernelState(self.path)

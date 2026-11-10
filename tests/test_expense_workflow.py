@@ -10,7 +10,7 @@ from pulpo.expense_workflow import (
     build_expense_effect,
 )
 from pulpo.state import InMemoryKernelState, SQLiteKernelState
-from tests.authority_support import HmacTestVerifier, signed_envelope, trust_for
+from tests.authority_support import HmacTestVerifier, signed_envelope, trust_for, signed_policy_envelope
 
 
 NOW = 12_000_000
@@ -79,7 +79,7 @@ class FieldExpenseGovernedEffectProofTests(unittest.TestCase):
         kernel = GovernanceKernel(
             policy,
             secret=b"field-expense-governed-effect-proof",
-            approval_verifier=verifier,
+            approval_verifier=verifier, policy_envelope=signed_policy_envelope(policy, verifier),
             clock=lambda: NOW,
             state=state,
         )

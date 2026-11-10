@@ -19,7 +19,7 @@ from pulpo.custody import SQLiteGovernanceCustody
 from pulpo.custody_reconcile import IndependentDomainObservation
 from pulpo.kernel import GovernanceKernel, Policy
 from pulpo.state import SQLiteKernelState
-from tests.authority_support import HmacTestVerifier, signed_envelope, trust_for
+from tests.authority_support import HmacTestVerifier, signed_envelope, signed_policy_envelope, trust_for
 
 from pulpo_custody_service.api import create_app
 from pulpo_custody_service.core import DomainCustodyService
@@ -142,6 +142,7 @@ class CustodyServiceApiTests(unittest.TestCase):
                     policy,
                     secret=b"service-kernel-secret",
                     approval_verifier=verifier,
+                    policy_envelope=signed_policy_envelope(policy, verifier) if verifier else None,
                     clock=lambda: NOW,
                     state=state,
                 )
@@ -164,6 +165,7 @@ class CustodyServiceApiTests(unittest.TestCase):
             policy,
             secret=b"service-kernel-secret",
             approval_verifier=verifier,
+            policy_envelope=signed_policy_envelope(policy, verifier) if verifier else None,
             clock=lambda: NOW,
         )
         return TestClient(create_app(service)), service, registrar, observer, signing_kernel, verifier

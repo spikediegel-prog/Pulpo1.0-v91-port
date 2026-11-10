@@ -711,10 +711,62 @@ class CommerceOutcome:
 
 
 class DomainCommerceExecutor:
-    """Consume a Pulpo permit before invoking a registrar adapter exactly once."""
+    """Consume a Pulpo permit before invoking a registrar adapter exactly once.
+
+    The live purchase path. The executor re-reads permit/directive state
+    immediately before the provider call and records an unknown provider
+    outcome as durable canonical evidence. No new executor, no second ledger:
+    unknown outcomes are events in the existing canonical audit.
+
+    PORT NOTE (v9.1 slice 1, upstream f084863): the custody-coordinator route
+    is NOT wired here (no `coordinator=` parameter, no locked-target
+    resolution through the coordinator). The coordinator itself exists
+    upstream (pulpo/custody_domain.py), so wiring it is a small follow-on;
+    this port carries the direct path only: same pre-purchase revalidation
+    and the same durable unknown-outcome record.
+    """
 
     def __init__(self, attempted_order_hashes: set[str] | None = None) -> None:
         self.attempted_order_hashes = attempted_order_hashes if attempted_order_hashes is not None else set()
+
+    def _record_purchase_event(
+        self,
+        kernel: GovernanceKernel,
+        event: str,
+        payload: dict[str, Any],
+        now_ns: int,
+    ) -> None:
+        # Best effort only: the spent permit, the attempted reservation, and
+        # the attempt set already block any retry, so a failed projection must
+        # never mask the outcome the caller has to reconcile. The failure mode
+        # is evidence-only, not a second execution right.
+        try:
+            kernel._state.append(event, payload, now_ns)  # noqa: SLF001 - existing canonical audit seam
+        except Exception:
+            pass
+
+    def _purchase_payload(
+        self,
+        kernel: GovernanceKernel,
+        order: DomainPurchaseOrder,
+        intent: Intent,
+        permit: str,
+        reservation_id: str,
+        *,
+        reason: str,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "order_hash": order.order_hash,
+            "intent_hash": kernel.intent_hash(intent),
+            # The permit itself is authority material; only its hash is evidence.
+            "permit_hash": sha256(permit.encode()).hexdigest(),
+            "reservation_id": reservation_id,
+            "reason": reason,
+        }
+        if error is not None:
+            payload["error"] = error
+        return payload
 
     def execute(
         self,
@@ -743,7 +795,41 @@ class DomainCommerceExecutor:
         budget.mark_attempted(reservation_id)
         self.attempted_order_hashes.add(order.order_hash)
         outcome = CommerceOutcome(order_hash=order.order_hash, authorized=True, capability_revoked=True)
-        result = adapter.purchase(order, max_charge_cents=order.purchase_price_cents)
+
+        # Re-read permit/directive state immediately before the provider call,
+        # under the same transaction discipline as consume. A revocation
+        # landing between consume and transmission refuses here, before any
+        # consequence exists.
+        revalidation = kernel.revalidate_consumed_permit(permit, intent)
+        if revalidation != "valid":
+            self._record_purchase_event(
+                kernel,
+                "purchase_revalidation_failed",
+                self._purchase_payload(
+                    kernel, order, intent, permit, reservation_id,
+                    reason=revalidation,
+                ),
+                now_ns,
+            )
+            raise CommerceViolation(revalidation)
+
+        try:
+            result = adapter.purchase(order, max_charge_cents=order.purchase_price_cents)
+        except Exception as exc:
+            # The provider call may already have changed reality. Record the
+            # unknown outcome as durable canonical evidence, then re-raise the
+            # original failure unchanged: no silent success, no blind retry.
+            self._record_purchase_event(
+                kernel,
+                "purchase_consequence_unknown",
+                self._purchase_payload(
+                    kernel, order, intent, permit, reservation_id,
+                    reason="external_consequence_not_yet_verified",
+                    error=type(exc).__name__,
+                ),
+                now_ns,
+            )
+            raise
 
         if result.payment_id is not None or result.charged_cents is not None or result.receipt_hash is not None:
             if None in (result.payment_id, result.charged_cents, result.receipt_hash):
