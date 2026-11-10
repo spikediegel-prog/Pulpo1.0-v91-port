@@ -13,7 +13,7 @@ import json
 from os import PathLike
 import sqlite3
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 def _canonical(value: Any) -> bytes:
@@ -60,9 +60,9 @@ class KernelState(Protocol):
     def audit(self) -> list[dict[str, Any]]: ...
     def approval_replay_reason(self, approval_id: str, nonce: str) -> str | None: ...
     def ceremony_replay_reason(self, evidence_id: str) -> str | None: ...
-    def issue_permit(self, permit: str, intent_hash: str, decision_reason: str, timestamp_ns: int, approval: ApprovalUse | None = None) -> str | None: ...
+    def issue_permit(self, permit: str, intent_hash: str, decision_reason: str, timestamp_ns: int, approval: ApprovalUse | None = None, *, clock: Callable[[], int] | None = None) -> str | None: ...
     def bind_permit_to_directive(self, permit: str, intent_hash: str, binding: DirectivePermitBinding, timestamp_ns: int) -> None: ...
-    def consume_permit(self, permit: str, intent_hash: str, timestamp_ns: int) -> bool: ...
+    def consume_permit(self, permit: str, intent_hash: str, timestamp_ns: int, *, clock: Callable[[], int] | None = None) -> bool: ...
     def revalidate_consumed_permit(self, permit: str, intent_hash: str, timestamp_ns: int) -> str: ...
     def directive_hash_status(self, directive_hash: str) -> str: ...
     def append(self, event: str, payload: dict[str, Any], timestamp_ns: int) -> None: ...
@@ -94,7 +94,7 @@ class InMemoryKernelState:
         if evidence_id in self._ceremony_evidence_ids: return "ceremony_evidence_replayed"
         return None
 
-    def issue_permit(self, permit: str, intent_hash: str, decision_reason: str, timestamp_ns: int, approval: ApprovalUse | None = None) -> str | None:
+    def issue_permit(self, permit: str, intent_hash: str, decision_reason: str, timestamp_ns: int, approval: ApprovalUse | None = None, *, clock: Callable[[], int] | None = None) -> str | None:
         # Serialize the whole check-and-record transition under the audit
         # lock (an RLock; append() re-enters it). The SQLite backend gets
         # the same atomicity from its BEGIN IMMEDIATE transaction: without
@@ -102,6 +102,7 @@ class InMemoryKernelState:
         # ceremony evidence id as unconsumed before either records it,
         # voiding single-use. Regression: tests/test_inmemory_ceremony_concurrency.py.
         with self._audit_lock:
+            timestamp_ns = _sample_post_lock_timestamp(timestamp_ns, clock)
             if approval is not None:
                 replay = self.approval_replay_reason(approval.approval_id, approval.nonce)
                 if replay: return replay
@@ -123,20 +124,25 @@ class InMemoryKernelState:
         self._permit_directives[permit] = binding
         self.append("permit_bound_to_directive", {"intent_hash": intent_hash, **binding.audit_payload()}, timestamp_ns)
 
-    def consume_permit(self, permit: str, intent_hash: str, timestamp_ns: int) -> bool:
-        valid = self._issued.get(permit) == intent_hash and permit not in self._spent
-        binding = self._permit_directives.get(permit)
-        payload: dict[str, Any] = {"intent_hash": intent_hash}
-        if binding is not None:
-            status = self.directive_status(binding.directive_id, binding.version, binding.directive_hash)
-            if status == "active" and binding.parent_directive_hash is not None:
-                status = self.directive_hash_status(binding.parent_directive_hash)
-            if status == "active" and not (binding.issued_at_ns <= timestamp_ns < binding.expires_at_ns): status = "directive_inactive"
-            valid = valid and status == "active"
-            payload.update(binding.audit_payload()); payload["directive_status"] = status
-        if valid: self._spent.add(permit)
-        self.append("permit_consumed" if valid else "permit_rejected", payload, timestamp_ns)
-        return valid
+    def consume_permit(self, permit: str, intent_hash: str, timestamp_ns: int, *, clock: Callable[[], int] | None = None) -> bool:
+        # PORT NOTE (v9.1 slice 2): upstream in-memory consume held no lock;
+        # the fix takes it, so the post-lock sample below is actually
+        # post-lock (same discipline as SQLite's BEGIN IMMEDIATE).
+        with self._audit_lock:
+            timestamp_ns = _sample_post_lock_timestamp(timestamp_ns, clock)
+            valid = self._issued.get(permit) == intent_hash and permit not in self._spent
+            binding = self._permit_directives.get(permit)
+            payload: dict[str, Any] = {"intent_hash": intent_hash}
+            if binding is not None:
+                status = self.directive_status(binding.directive_id, binding.version, binding.directive_hash)
+                if status == "active" and binding.parent_directive_hash is not None:
+                    status = self.directive_hash_status(binding.parent_directive_hash)
+                if status == "active" and not (binding.issued_at_ns <= timestamp_ns < binding.expires_at_ns): status = "directive_inactive"
+                valid = valid and status == "active"
+                payload.update(binding.audit_payload()); payload["directive_status"] = status
+            if valid: self._spent.add(permit)
+            self.append("permit_consumed" if valid else "permit_rejected", payload, timestamp_ns)
+            return valid
 
     def revalidate_consumed_permit(self, permit: str, intent_hash: str, timestamp_ns: int) -> str:
         # Read-only re-check of the exact state consume_permit validated, under
@@ -229,6 +235,54 @@ class InMemoryKernelState:
             return None
 
 
+class StateClockError(ValueError):
+    """A post-lock clock sample failed, or the clock regressed between the
+    pre-lock sample and the post-lock sample.
+
+    Fail-closed: the write is refused rather than stamping canonical evidence
+    with an untrusted time. For SQLite the enclosing transaction rolls back,
+    so a refused consume leaves the permit unspent.
+    """
+
+
+def _sample_post_lock_timestamp(timestamp_ns: int, clock: Callable[[], int] | None) -> int:
+    """Re-sample the clock after the lock; fall back to the caller's timestamp.
+
+    Call only after BEGIN IMMEDIATE (SQLite) or after acquiring _audit_lock
+    (in-memory), so the returned timestamp cannot predate the lock. This is
+    the custody pattern (``_custody_now`` in custody.py) ported to the kernel
+    paths: validity checks inside the transaction then run on a post-lock
+    timestamp instead of the kernel's pre-lock sample.
+
+    The regression check compares the post-lock sample against the same
+    clock's pre-lock sample, not against the audit tip. Custody can compare
+    against its head time because one custody store has one clock and the head
+    time was written by that same clock. Kernel state has no clock of its own:
+    its audit tip conflates timestamps from every kernel sharing the state
+    (each with its own injected clock) and from direct state callers, and
+    legacy adoption deliberately preserves non-monotonic histories (see
+    test_v91_clock_toctou.py::test_out_of_order_append_preserved_for_legacy).
+    A tip comparison would reject legitimate skewed-clock writes -- e.g. two
+    kernels sharing state with clocks 1 ns apart. Adjacent samples from one
+    clock are the faithful analogue, and the strongest per-clock check
+    available without new state: a regression between the two samples means
+    the clock went backwards across exactly the lock boundary the TOCTOU fix
+    closes. With no clock supplied the caller owns the timestamp and no
+    regression check applies; the directive-window checks still bound it.
+    """
+    if clock is None:
+        return timestamp_ns
+    try:
+        fresh = clock()
+    except Exception as exc:
+        raise StateClockError("state_clock_unavailable") from exc
+    if type(fresh) is not int or fresh <= 0:
+        raise StateClockError("state_clock_invalid")
+    if type(timestamp_ns) is int and fresh < timestamp_ns:
+        raise StateClockError("state_clock_rollback")
+    return fresh
+
+
 class SQLiteKernelState:
     def __init__(self, path: str | PathLike[str]) -> None:
         self._connection = sqlite3.connect(path)
@@ -273,9 +327,10 @@ class SQLiteKernelState:
         ).fetchone()
         return row[0] if row is not None else None
 
-    def issue_permit(self, permit: str, intent_hash: str, decision_reason: str, timestamp_ns: int, approval: ApprovalUse | None = None) -> str | None:
+    def issue_permit(self, permit: str, intent_hash: str, decision_reason: str, timestamp_ns: int, approval: ApprovalUse | None = None, *, clock: Callable[[], int] | None = None) -> str | None:
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
+            timestamp_ns = _sample_post_lock_timestamp(timestamp_ns, clock)
             if approval is not None:
                 replay = self._approval_replay_reason(approval.approval_id, approval.nonce)
                 if replay: return replay
@@ -301,9 +356,10 @@ class SQLiteKernelState:
             self._connection.execute("INSERT INTO permit_directives (permit, directive_id, directive_version, directive_hash, directive_issued_at_ns, directive_expires_at_ns, parent_directive_hash) VALUES (?, ?, ?, ?, ?, ?, ?)", (permit, binding.directive_id, binding.version, binding.directive_hash, binding.issued_at_ns, binding.expires_at_ns, binding.parent_directive_hash))
             self._append("permit_bound_to_directive", {"intent_hash": intent_hash, **binding.audit_payload()}, timestamp_ns)
 
-    def consume_permit(self, permit: str, intent_hash: str, timestamp_ns: int) -> bool:
+    def consume_permit(self, permit: str, intent_hash: str, timestamp_ns: int, *, clock: Callable[[], int] | None = None) -> bool:
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
+            timestamp_ns = _sample_post_lock_timestamp(timestamp_ns, clock)
             permit_row = self._connection.execute("SELECT intent_hash, spent FROM permits WHERE permit = ?", (permit,)).fetchone()
             valid = permit_row is not None and permit_row[0] == intent_hash and permit_row[1] == 0
             payload: dict[str, Any] = {"intent_hash": intent_hash}

@@ -35,7 +35,7 @@ from .orchestrator import (
     OrchestrationError,
     PulpoOrchestrator,
 )
-from .state import InMemoryKernelState, KernelState, SQLiteKernelState
+from .state import InMemoryKernelState, KernelState, SQLiteKernelState, StateClockError
 from .target_reconcile import (
     ArtifactCompletionEvidence,
     GovernedTargetReconciliation,
@@ -76,6 +76,7 @@ __all__ = [
     "PulpoOrchestrator",
     "SQLiteBudgetAccount",
     "SQLiteKernelState",
+    "StateClockError",
     "StateIntegrityError",
     "TargetObligationStatus",
     "TargetResolution",

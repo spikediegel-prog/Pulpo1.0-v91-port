@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from .authority import ApprovalEnvelope, ApprovalVerifier, AuthorityTrust
 from .ceremony import CeremonyEvidence, CeremonyTrust, CeremonyVerifier
-from .state import ApprovalUse, InMemoryKernelState, KernelState
+from .state import ApprovalUse, InMemoryKernelState, KernelState, StateClockError
 
 
 def _canonical(value: Any) -> bytes:
@@ -671,8 +671,18 @@ class GovernanceKernel:
         payload = f"{digest}:{nonce}"
         signature = hmac.new(self._secret, payload.encode(), sha256).hexdigest()
         permit = f"{payload}:{signature}"
-        issued_at_ns = self._clock() if timestamp_ns is None else timestamp_ns
-        replay = self._state.issue_permit(permit, digest, reason, issued_at_ns, approval)
+        # Only the kernel's own sample is re-sampled inside the state
+        # transaction. An explicitly supplied timestamp (the approval path's
+        # post-verification time) is a deliberate binding, not a race, and is
+        # passed through without a clock.
+        sampled_here = timestamp_ns is None
+        issued_at_ns = self._clock() if sampled_here else timestamp_ns
+        try:
+            replay = self._state.issue_permit(permit, digest, reason, issued_at_ns, approval,
+                clock=self._clock if sampled_here else None)
+        except StateClockError as exc:
+            # The clock broke or regressed after the pre-lock sample.
+            raise RuntimeError("permit_clock_invalid") from exc
         if replay:
             if envelope is None:
                 raise RuntimeError("state rejected an approval-free permit")
@@ -719,7 +729,18 @@ class GovernanceKernel:
 
     def consume(self, permit: str, intent: Intent) -> bool:
         digest = self.intent_hash(intent)
-        return self._state.consume_permit(permit, digest, self._clock())
+        now_ns = self._clock()
+        try:
+            # The pre-lock sample is the fallback; the state re-samples the
+            # clock after acquiring the lock, so the validity checks inside
+            # the transaction run on a post-lock timestamp.
+            return self._state.consume_permit(permit, digest, now_ns, clock=self._clock)
+        except StateClockError:
+            # The clock broke or regressed between the pre-lock sample and the
+            # locked transaction: fail closed without consuming, and record
+            # the refusal with the no-trusted-time sentinel.
+            self._state.append("permit_rejected", {"intent_hash": digest, "reason": "permit_clock_invalid"}, 0)
+            return False
 
     def revalidate_consumed_permit(self, permit: str, intent: Intent) -> str:
         """Re-read permit/directive state for an already-spent permit.
