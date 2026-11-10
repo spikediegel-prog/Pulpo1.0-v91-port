@@ -36,6 +36,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from pulpo.commerce import (
     BudgetAccount,
@@ -43,6 +44,7 @@ from pulpo.commerce import (
     DomainCommerceExecutor,
     DomainPurchaseRequest,
     DomainQuote,
+    PurchaseEvidenceError,
     RegistrarResult,
     SQLiteBudgetAccount,
     assess_quote,
@@ -104,6 +106,30 @@ class HookedBudget:
 
     def reconcile(self, reservation_id, payment):
         return self._wrapped.reconcile(reservation_id, payment)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+class FailingAppendState:
+    """Kernel-state delegate whose append fails a scripted number of times.
+
+    Proves the F1 retry: a transient failure is recovered by the retry and
+    the record lands; a persistent failure surfaces as
+    PurchaseEvidenceError instead of disappearing. Installed on the kernel
+    after the permit is issued, so only the purchase-event appends fail.
+    """
+
+    def __init__(self, wrapped, failures):
+        self._wrapped = wrapped
+        self._failures = failures
+        self.append_calls = 0
+
+    def append(self, event, payload, timestamp_ns):
+        self.append_calls += 1
+        if self.append_calls <= self._failures:
+            raise sqlite3.OperationalError("database is locked")
+        return self._wrapped.append(event, payload, timestamp_ns)
 
     def __getattr__(self, name):
         return getattr(self._wrapped, name)
@@ -381,6 +407,74 @@ class LivePurchaseCustodyTests(unittest.TestCase):
                 )
             self.assertEqual(0, should_not_run.calls)
             self.assertEqual(1, len(audit_events(kernel, "purchase_consequence_unknown")))
+
+    # (f) F1: the unknown-outcome record is never lost silently.
+    def test_transient_append_failure_is_recovered_by_retry(self):
+        order = self.order()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kernel.sqlite3"
+            state = SQLiteKernelState(path)
+            self.addCleanup(state.close)
+            kernel, permit = self.kernel_with(order, state=state)
+            budget = SQLiteBudgetAccount(path)
+            reservation = budget.reserve(order, now_ns=NOW)
+            uncertain = UncertainRegistrar()
+            failing = FailingAppendState(state, failures=1)
+            kernel._state = failing  # noqa: SLF001 - the append seam under test
+
+            with mock.patch("pulpo.commerce._EVIDENCE_RECORD_RETRY_DELAY_S", 0):
+                with self.assertRaisesRegex(ConnectionError, "unknown"):
+                    DomainCommerceExecutor().execute(
+                        kernel, order, permit, uncertain, budget,
+                        reservation.reservation_id, now_ns=NOW,
+                    )
+            # The first append failed, the retry landed the record.
+            self.assertEqual(2, failing.append_calls)
+            unknown = audit_events(kernel, "purchase_consequence_unknown")
+            self.assertEqual(1, len(unknown))
+            self.assertEqual(order.order_hash, unknown[0]["payload"]["order_hash"])
+            self.assertTrue(kernel.verify_audit())
+
+    def test_persistent_append_failure_surfaces_instead_of_disappearing(self):
+        order = self.order()
+        kernel, permit = self.kernel_with(order)
+        budget = BudgetAccount()
+        reservation = budget.reserve(order, now_ns=NOW)
+        uncertain = UncertainRegistrar()
+        failing = FailingAppendState(kernel._state, failures=10)
+        kernel._state = failing  # noqa: SLF001 - the append seam under test
+
+        with mock.patch("pulpo.commerce._EVIDENCE_RECORD_RETRY_DELAY_S", 0):
+            with self.assertRaisesRegex(CommerceViolation, "purchase_evidence_unrecorded") as ctx:
+                DomainCommerceExecutor().execute(
+                    kernel, order, permit, uncertain, budget,
+                    reservation.reservation_id, now_ns=NOW,
+                )
+        # The provider error is preserved as the cause; the caller learns
+        # both that the outcome is unknown and that the evidence is missing.
+        self.assertIsInstance(ctx.exception.__cause__, ConnectionError)
+        self.assertEqual(2, failing.append_calls)
+        self.assertEqual([], audit_events(kernel, "purchase_consequence_unknown"))
+        self.assertTrue(kernel.verify_audit())
+
+    def test_record_purchase_event_raises_after_one_retry(self):
+        # The retry itself: a directly-driven _record_purchase_event fails
+        # twice (initial + one retry) and then raises PurchaseEvidenceError.
+        order = self.order()
+        kernel, _permit = self.kernel_with(order)
+        failing = FailingAppendState(kernel._state, failures=10)
+        kernel._state = failing  # noqa: SLF001 - the append seam under test
+        executor = DomainCommerceExecutor()
+
+        with mock.patch("pulpo.commerce._EVIDENCE_RECORD_RETRY_DELAY_S", 0):
+            with self.assertRaises(PurchaseEvidenceError) as ctx:
+                executor._record_purchase_event(  # noqa: SLF001 - the seam under test
+                    kernel, "purchase_consequence_unknown",
+                    {"order_hash": order.order_hash}, NOW,
+                )
+        self.assertEqual("purchase_consequence_unknown", str(ctx.exception))
+        self.assertEqual(2, failing.append_calls)
+        self.assertIsInstance(ctx.exception.__cause__, sqlite3.OperationalError)
 
     # Coordinator route.
     def custody_stack(self, path):
