@@ -26,7 +26,7 @@ from pulpo import (
     SQLiteKernelState,
 )
 from pulpo.state import ApprovalUse, InMemoryKernelState
-from tests.authority_support import HmacTestVerifier, signed_envelope, trust_for
+from tests.authority_support import HmacTestVerifier, signed_envelope, signed_policy_envelope, trust_for
 
 
 NOW = 1_000_000
@@ -115,6 +115,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             self.policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(self.policy, self.verifier),
             clock=lambda: NOW,
             ceremony_verifier=self.ceremony,
         )
@@ -233,6 +234,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             self.policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(self.policy, self.verifier),
             clock=lambda: NOW,
             state=state,
             ceremony_verifier=self.ceremony,
@@ -250,6 +252,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             self.policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(self.policy, self.verifier),
             clock=lambda: NOW,
             state=SQLiteKernelState(self._sqlite_path),
             ceremony_verifier=self.ceremony,
@@ -399,6 +402,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             self.policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(self.policy, self.verifier),
             clock=lambda: clock_value[0],
             ceremony_verifier=ceremony,
         )
@@ -429,6 +433,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             self.policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(self.policy, self.verifier),
             clock=lambda: NOW,
         )
         envelope = signed_envelope(kernel, self.intent, self.verifier, now_ns=NOW)
@@ -472,6 +477,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             GovernanceKernel(
                 self.policy,
                 approval_verifier=self.verifier,
+                policy_envelope=signed_policy_envelope(self.policy, self.verifier),
                 clock=lambda: NOW,
                 ceremony_verifier=mismatched,
             )
@@ -505,6 +511,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             legacy_policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(legacy_policy, self.verifier),
             clock=lambda: NOW,
         )
         trust = legacy_policy.authority_trust
@@ -539,6 +546,7 @@ class CeremonyEvidenceTests(unittest.TestCase):
             policy,
             secret=b"unit-test-secret",
             approval_verifier=self.verifier,
+            policy_envelope=signed_policy_envelope(policy, self.verifier),
             clock=lambda: NOW,
             ceremony_verifier=self.ceremony,
         )
