@@ -146,3 +146,29 @@ empty counters (comment in the code). The `in_transaction` check works
 on a plain sqlite3 connection. The unknown-outcome evidence from slice 1
 (`purchase_consequence_unknown` in the canonical audit) now has the
 unified evidence projection upstream as well.
+
+## Incident channel (Preview PRs #119-#123)
+
+Ported as code in four PRs, one per Preview slice, in order.
+
+### Slice 1 - library-only channel (Preview PR #119)
+
+Ported in PR #6 (branch `port/incident-channel`). New
+`pulpo/incident_channel.py` (Preview 8c9aeb9 form, v1 envelopes),
+read-only `attempts()` on `SQLiteGovernanceCustody` (42 lines, verbatim
+addition to `pulpo/custody.py`), `tests/test_incident_channel.py`
+(36 tests, verbatim), and `docs/incident-channel.md`.
+
+One adaptation: `freeze_incident_report` in the fork reads the
+activity-tracking connection `activity_id` for the report source id.
+The port tree has a raw sqlite3 connection with no such counters, so
+the ported freeze falls back to the process-scoped source id via
+`getattr` (same pattern as `evidence_export.py`; comment in the code).
+
+Custody time: the store records no per-attempt timestamp -
+created/updated epochs are head-epoch counters, not seconds. A
+custody-sourced record carries the store head `custody_time_ns` at
+freeze time as both first/last seen: an upper bound, not the attempt
+own time. Unchanged from Preview.
+
+Slices 2-4 follow as separate PRs.
