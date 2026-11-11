@@ -171,4 +171,36 @@ custody-sourced record carries the store head `custody_time_ns` at
 freeze time as both first/last seen: an upper bound, not the attempt
 own time. Unchanged from Preview.
 
-Slices 2-4 follow as separate PRs.
+### Slice 2 - live-path reconciliation (Preview PR #120)
+
+Ported in PR #7 (branch `port/incident-reconciliation`, stacked on PR #6).
+Coordinator purchases drive claim/transmit/reconcile on the live path:
+success reconciles from the live executor own observation
+(`pulpo.commerce.live`, schema `pulpo.live-purchase-observation.v0`),
+charge-exceeded reconciles as failure, unknown leaves the attempt
+reconciliation-required for later independent reconciliation. A refusal
+at revalidation yields exactly one near-miss: the channel consumes the
+custody attempt by attempt id, else by order hash. `PulpoOrchestrator`
+threads an optional `evidence_projector` through to the executor, so
+wired projections reach the canonical audit as `custody_transition`
+events.
+
+Two adaptations. First, the fork `authorize_transmission` accepts an
+`expires_at_ns` that the port tree custody did not have (upstream
+`f084863` has no such parameter); the port adds it verbatim from the
+fork (`_transition_attempt` refuses an expired order, the receipt
+carries `order_expires_at_ns`), since the ported live path passes the
+order expiry through. Second, the new end-to-end refusal test in
+Preview triggers the refusal with a permit TTL (`permit_ttl_ns`);
+upstream permits never expire, so the port triggers it with a revoked
+directive instead. The property under test -- one near-miss, attempt
+id carried -- is unchanged.
+
+No new custody states, no widened `reconcile_observed`, no cancel
+transition: a refused attempt still sits `attempt_authorized` in the
+store (permit spent, can never execute). That vocabulary gap carries
+over unchanged; the PR does not invent a fix. Reconciliation on the
+live path is first-party, not independent: the observation is the
+provider synchronous return, never an independent observation.
+
+Slices 3-4 follow as separate PRs.

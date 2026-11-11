@@ -457,6 +457,7 @@ class SQLiteGovernanceCustody:
         next_state: str,
         payload: dict[str, Any],
         updates: dict[str, str | None] | None = None,
+        expires_at_ns: int | None = None,
     ) -> TransitionReceipt:
         if not attempt_id:
             raise CustodyViolation("attempt_id_required")
@@ -480,6 +481,9 @@ class SQLiteGovernanceCustody:
                 object_hash=object_hash,
                 payload={"attempt_id": attempt_id, "from_state": state, **payload},
             )
+            if expires_at_ns is not None:
+                if type(expires_at_ns) is not int or receipt.custody_time_ns >= expires_at_ns:
+                    raise CustodyViolation("order_expired")
             assignments = ["state = ?", "updated_epoch = ?"]
             values: list[Any] = [next_state, receipt.epoch]
             for column, value in (updates or {}).items():
@@ -536,6 +540,7 @@ class SQLiteGovernanceCustody:
         expected_state_root: str,
         attempt_id: str,
         provider_request_id: str | None = None,
+        expires_at_ns: int | None = None,
     ) -> TransmissionAuthorization:
         """Release the one provider-transmission right before the network call.
 
@@ -556,8 +561,10 @@ class SQLiteGovernanceCustody:
             payload={
                 "provider_request_id": provider_request_id,
                 "idempotency_key": idempotency_key,
+                **({} if expires_at_ns is None else {"order_expires_at_ns": expires_at_ns}),
             },
             updates={"provider_request_id": provider_request_id},
+            expires_at_ns=expires_at_ns,
         )
         return TransmissionAuthorization(attempt_id, idempotency_key, receipt)
 
