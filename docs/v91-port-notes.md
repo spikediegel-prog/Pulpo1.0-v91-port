@@ -2,8 +2,9 @@
 
 Branch `v91-port-f084863` in this clone. Base: upstream main
 `f084863` ("fix: serialize in-memory issue_permit check-and-record;
-ceremony single-use concurrency regression (#342)"). Nothing here has
-been pushed anywhere; there is no PR against Ironnember/Pulpo1.0.
+ceremony single-use concurrency regression (#342)"). Pushed to `spikediegel-prog/Pulpo1.0-v91-port`; merged as PR #1
+(`c44ca6c`), PR #2 (`4fd03d5`), and PR #3 (`cf753a9`). No PR against
+Ironnember/Pulpo1.0.
 
 Validation (Linux VM, `python3 -W error -m unittest discover -s tests`):
 
@@ -16,6 +17,14 @@ Validation (Linux VM, `python3 -W error -m unittest discover -s tests`):
 - `proofs/pulpo-node/virtual_lamp_proof.py`: PASS (14 checks)
 - `proofs/incident-response/synthetic_incident_response_proof.py`: PASS
   (14 checks)
+- merged main (PRs #1-#3, `cf753a9`): 491 OK, skipped=1
+- Gladiator (`scripts/run_gladiator_tournament.py`): `FINAL
+  PASS_WITH_BOUNDARIES 138 10600` on this tree vs `160 10600` on Preview
+  main. The runner is byte-identical to upstream and the 10600 scheduled
+  operations are identical; the 22-execution gap is entirely in the
+  qualification phases (state +21, evidence +3, consequence -2 on Preview)
+  because the Preview test corpus is larger (1308 tests vs 486 here) — not
+  a coverage loss. The proof passes; the count is not an assertion.
 
 ## Slice 1 — live purchase: pre-purchase revalidation + durable unknown outcome
 
