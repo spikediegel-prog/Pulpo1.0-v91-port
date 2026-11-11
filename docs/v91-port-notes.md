@@ -25,6 +25,7 @@ Validation (Linux VM, `python3 -W error -m unittest discover -s tests`):
   qualification phases (state +21, evidence +3, consequence -2 on Preview)
   because the Preview test corpus is larger (1308 tests vs 486 here) — not
   a coverage loss. The proof passes; the count is not an assertion.
+- + slice 4 (this branch): 500 OK, skipped=1
 
 ## Slice 1 — live purchase: pre-purchase revalidation + durable unknown outcome
 
@@ -118,9 +119,16 @@ Adapted, not carried verbatim:
 
 ## Slice 4 — evidence vocabulary (AUTHORIZED / ATTEMPTED / CONSEQUENCE UNKNOWN)
 
-NOT ported as code. The slice patches `pulpo/evidence_observation.py`
-and `pulpo/evidence_export.py`, which do not exist upstream, so there is
-no file to patch and the diff cannot cherry-pick. Nothing was forced.
+Ported as code in PR #5 (branch `port/slice-4-evidence-vocabulary`).
+The slice patches `pulpo/evidence_observation.py` and
+`pulpo/evidence_export.py`, which do not exist upstream, so the port
+brings the two modules in, in their post-slice-4 form (Preview 5ee668c),
+as new files - plus `tests/test_evidence_vocabulary.py` (9 tests,
+verbatim) and the two small publication/reader primitives the modules
+need from the fork (`_publish_snapshot` in `pulpo/mcp_boundary.py`,
+`read_snapshot_document` in `pulpo/mcp_plugin.py`, both verbatim
+additions; the existing `export_mcp_snapshot` / `load_mcp_snapshot`
+are untouched).
 
 What transfers as design: the `STATE_OUTCOMES` mapping terms are
 identical upstream — `pulpo/custody.py` has the same lifecycle constants
@@ -129,13 +137,12 @@ identical upstream — `pulpo/custody.py` has the same lifecycle constants
 `unresolved`) and `pulpo/effect_reconcile.py` has the same `"uncertain"`
 status — so the mapping itself needs no adaptation.
 
-What upstream would need for this slice to port as code: the evidence
-modules themselves (`evidence_observation.py` /
-`evidence_export.py`, i.e. the `EvidenceEvent` / `EvidenceObservation`
-contract, the `OUTCOMES` / `EVENT_NAMES` enums, and the
-`freeze_evidence_observation` / `export_evidence_observation`
-projection), plus `tests/test_evidence_vocabulary.py`. That is a
-port of the Preview evidence-export surface, not a change to the
-vocabulary mapping. Until then, the unknown-outcome evidence from slice 1
-(`purchase_consequence_unknown` in the canonical audit) exists upstream
-without the unified evidence projection.
+One adaptation: `freeze_evidence_observation` in the fork reads
+per-connection activity counters (`connection.activity_id` /
+`connection.activity`) from the fork activity-tracking connection.
+The port tree has a raw sqlite3 connection with no such counters, so
+the ported projection falls back to the process-scoped source id and
+empty counters (comment in the code). The `in_transaction` check works
+on a plain sqlite3 connection. The unknown-outcome evidence from slice 1
+(`purchase_consequence_unknown` in the canonical audit) now has the
+unified evidence projection upstream as well.
