@@ -223,4 +223,26 @@ uses, and the derivation reads the audit in the same format upstream
 already produces. The slice-1 source-id deviation (process-scoped
 fallback where the port tree has no activity counters) is untouched.
 
-Slice 4 follows as a separate PR.
+### Slice 4 - CLI only (Preview PR #123)
+
+Ported in PR #9 (branch `port/incident-cli`, stacked on PR #8).
+`pulpo incidents list/show/summary`: list, show, and summary over a
+frozen v2 incident report, read-only -- the CLI loads the snapshot and
+never opens a database, never appends to the audit, and offers no
+lifecycle transition. Filters: kind, resolution, lifecycle, time
+window. Exit 2 on a missing or invalid report. 14 CLI tests, verbatim.
+
+Two things were NOT ported. First, the Tkinter Evidence page
+(`pulpo/evidence_incidents.py`, the Evidence-page section, 10 UI tests):
+the port tree has no Control Center UI files -- the Evidence page is a
+fork addition with no upstream home -- so the UI stays Preview-only.
+Second, the port tree has no CLI at all upstream (no `pulpo/cli.py`,
+no console script), and Preview cli.py also carries verify, setup,
+and tune subcommands that depend on fork-only packages (`pulpo.setup`,
+`pulpo.verifier`, the Tkinter tuning window). The port therefore adds
+a reduced `pulpo/cli.py` (186 lines) carrying only the `incidents`
+subcommand: the incidents functions and parser are verbatim from
+Preview 4945147, the rest is not ported. No console script is
+registered; run it as `python -m pulpo.cli incidents ...`.
+
+The incident channel port is complete with this PR: slices 1-4.
