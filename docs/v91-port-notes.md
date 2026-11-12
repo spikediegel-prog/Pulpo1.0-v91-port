@@ -203,4 +203,24 @@ over unchanged; the PR does not invent a fix. Reconciliation on the
 live path is first-party, not independent: the observation is the
 provider synchronous return, never an independent observation.
 
-Slices 3-4 follow as separate PRs.
+### Slice 3 - lifecycle (Preview PR #122)
+
+Ported in PR #8 (branch `port/incident-lifecycle`, stacked on PR #7).
+Incident records carry a handling lifecycle -- open, acknowledged,
+resolved, closed -- recorded as `incident_lifecycle` audit events, never
+as a mutation: the current state is derived from the audit chain.
+Reopen from resolved or closed only. Near-misses carry `not_applicable`
+and accept no transitions. Closing an unresolved incident is allowed
+with an explicit override and a required reason (recorded
+`override: true`). Actor is attribution (`operator:<name>` /
+`process:<name>`), not authentication. Schema v2
+(`pulpo.incident-record.v2` / `pulpo.incident-report.v2`); v1 snapshots
+are not loadable. `list_incidents` gains a `lifecycle=` filter.
+
+No adaptation: the transition appends through the existing canonical
+audit seam (`kernel._state.append`), the same seam the commerce path
+uses, and the derivation reads the audit in the same format upstream
+already produces. The slice-1 source-id deviation (process-scoped
+fallback where the port tree has no activity counters) is untouched.
+
+Slice 4 follows as a separate PR.
